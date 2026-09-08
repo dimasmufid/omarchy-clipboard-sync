@@ -40,6 +40,9 @@ the right bar section. The following live checks succeeded:
   daemon from the adapter.
 - No plugin-specific QML errors appeared in the shell journal during these
   checks.
+- UFW initially blocked unsolicited KDE Connect traffic. TCP and UDP ports
+  1714–1764 were opened only to the current `192.168.100.0/24` LAN; discovery
+  then ran successfully but still reported no visible phone.
 
 ## Pending physical-device validation
 

@@ -22,7 +22,7 @@ if [[ "${1:-}" == "--list-available" ]]; then
     printf '%s\n' 'org.freedesktop.DBus.Error.ServiceUnknown' >&2
     exit 1
   fi
-  if [[ "$scenario" == "online" || "$scenario" == "duplicate-names" || ( "$scenario" == "pairable" && -n "$state_file" && -f "$state_file" ) ]]; then
+  if [[ "$scenario" == "online" || "$scenario" == "duplicate-names" || "$scenario" == "available-overrides-detail" || ( "$scenario" == "pairable" && -n "$state_file" && -f "$state_file" ) ]]; then
     printf '%s\n' "$device_id"
   fi
   exit 0
@@ -34,6 +34,7 @@ if [[ "${1:-}" == "--list-devices" ]]; then
     malformed) printf '%s\n' 'unexpected device output' ;;
     offline) printf '%s\n' "- $device_name: $device_id (paired)" ;;
     unpaired) printf '%s\n' "- $device_name: $device_id (reachable)" ;;
+    available-overrides-detail) printf '%s\n' "- $device_name: $device_id (reachable)" ;;
     pairable)
       if [[ -n "$state_file" && -f "$state_file" ]]; then
         printf '%s\n' "- $device_name: $device_id on 192.0.2.2 via lan (paired and reachable)"

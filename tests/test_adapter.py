@@ -68,6 +68,13 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(devices[1]["reachable"])
         self.assertNotEqual(devices[0]["id"], devices[1]["id"])
 
+    def test_available_set_overrides_human_readable_detail(self):
+        completed, payload = self.invoke("devices", scenario="available-overrides-detail")
+        self.assertEqual(completed.returncode, 0)
+        device = payload["data"]["devices"][0]
+        self.assertTrue(device["paired"])
+        self.assertTrue(device["reachable"])
+
     def test_unicode_and_metacharacters_are_data(self):
         name = "Phone $(touch nope) ' 👋"
         completed, payload = self.invoke(

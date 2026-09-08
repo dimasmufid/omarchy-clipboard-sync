@@ -207,10 +207,17 @@ def parse_device_line(line: str) -> dict[str, Any] | None:
 
 def list_devices() -> list[dict[str, Any]]:
     completed = run([kdeconnect_cli(), "--list-devices"])
+    available_ids = available_device_ids()
     devices: list[dict[str, Any]] = []
     for raw_line in completed.stdout.splitlines():
         parsed = parse_device_line(raw_line)
         if parsed:
+            # KDE Connect defines --list-available as the paired-and-reachable
+            # subset. Prefer that machine-oriented result over localized or
+            # version-dependent annotations in --list-devices output.
+            if parsed["id"] in available_ids:
+                parsed["paired"] = True
+                parsed["reachable"] = True
             devices.append(parsed)
 
     if completed.stdout.strip() and not devices:

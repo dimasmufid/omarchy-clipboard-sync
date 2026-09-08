@@ -38,6 +38,21 @@ The D-Bus service normally starts on demand.
 - KDE Connect commonly uses TCP and UDP ports 1714–1764. Review the active
   firewall before making any change; the plugin never changes it automatically.
 
+For UFW, prefer rules restricted to the current LAN instead of exposing the
+ports to every source. Replace the example subnet with the LAN reported by
+`ip route`:
+
+```bash
+sudo ufw allow proto tcp from 192.168.100.0/24 to any port 1714:1764 \
+  comment 'KDE Connect LAN'
+sudo ufw allow proto udp from 192.168.100.0/24 to any port 1714:1764 \
+  comment 'KDE Connect LAN'
+sudo ufw reload
+```
+
+These rules may need to be replaced when the computer moves to a LAN with a
+different subnet.
+
 ## Paired phone is offline
 
 - Wake the phone and open KDE Connect.
