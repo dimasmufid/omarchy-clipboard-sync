@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scenario="${CLIPBOARD_SYNC_TEST_CLIPBOARD:-text}"
+
+if [[ "${1:-}" == "--list-types" ]]; then
+  case "$scenario" in
+    empty) exit 1 ;;
+    image) printf '%s\n' 'image/png' ;;
+    html) printf '%s\n' 'text/html' ;;
+    mixed) printf '%s\n' 'text/html' 'text/plain;charset=utf-8' ;;
+    *) printf '%s\n' 'text/plain;charset=utf-8' ;;
+  esac
+  exit 0
+fi
+
+case "$scenario" in
+  empty) exit 1 ;;
+  exact-limit) head -c 65536 /dev/zero | tr '\0' x ;;
+  oversized) head -c 65537 /dev/zero | tr '\0' x ;;
+  unicode) printf '%s' 'Halo 👋 世界' ;;
+  invalid) printf '\xff\xfe' ;;
+  *) printf '%s' "${CLIPBOARD_SYNC_TEST_TEXT:-hello from omarchy}" ;;
+esac

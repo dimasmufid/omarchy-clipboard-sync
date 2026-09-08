@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "dimasmufid.clipboard-sync",
+  "name": "Clipboard Sync",
+  "version": "0.1.0",
+  "author": "Dimas Mufid",
+  "license": "MIT",
+  "description": "Connect Omarchy's Wayland clipboard with trusted phones.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "ClipboardSync.qml"
+  },
+  "barWidget": {
+    "displayName": "Clipboard Sync",
+    "description": "Phone connection and clipboard synchronization status.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15,
+      "selectedDeviceId": "",
+      "paused": false,
+      "mode": "manual"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 15
+      }
+    ]
+  }
+}

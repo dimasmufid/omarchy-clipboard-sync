@@ -1,0 +1,6 @@
+*.qmlc
+*.pyc
+.qmlls.ini
+.cache/
+__pycache__/
+build/

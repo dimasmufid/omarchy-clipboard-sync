@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scenario="${CLIPBOARD_SYNC_TEST_SCENARIO:-online}"
+device_id="${CLIPBOARD_SYNC_TEST_DEVICE_ID:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+device_name="${CLIPBOARD_SYNC_TEST_DEVICE_NAME:-Test Phone}"
+state_file="${CLIPBOARD_SYNC_TEST_STATE_FILE:-}"
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'kdeconnect-cli 24.12.0'
+  exit 0
+fi
+
+if [[ "${1:-}" == "--refresh" ]]; then
+  [[ "$scenario" != "command-error" ]] || { printf '%s\n' 'refresh failed' >&2; exit 1; }
+  exit 0
+fi
+
+if [[ "${1:-}" == "--list-available" ]]; then
+  if [[ "$scenario" == "timeout" ]]; then sleep 2; fi
+  if [[ "$scenario" == "daemon-error" ]]; then
+    printf '%s\n' 'org.freedesktop.DBus.Error.ServiceUnknown' >&2
+    exit 1
+  fi
+  if [[ "$scenario" == "online" || "$scenario" == "duplicate-names" || ( "$scenario" == "pairable" && -n "$state_file" && -f "$state_file" ) ]]; then
+    printf '%s\n' "$device_id"
+  fi
+  exit 0
+fi
+
+if [[ "${1:-}" == "--list-devices" ]]; then
+  case "$scenario" in
+    no-devices) ;;
+    malformed) printf '%s\n' 'unexpected device output' ;;
+    offline) printf '%s\n' "- $device_name: $device_id (paired)" ;;
+    unpaired) printf '%s\n' "- $device_name: $device_id (reachable)" ;;
+    pairable)
+      if [[ -n "$state_file" && -f "$state_file" ]]; then
+        printf '%s\n' "- $device_name: $device_id on 192.0.2.2 via lan (paired and reachable)"
+      else
+        printf '%s\n' "- $device_name: $device_id on 192.0.2.2 via lan (reachable)"
+      fi
+      ;;
+    pair-rejected|pair-timeout)
+      printf '%s\n' "- $device_name: $device_id on 192.0.2.2 via lan (reachable)"
+      ;;
+    duplicate-names)
+      printf '%s\n' "- $device_name: $device_id on 192.0.2.2 via lan (paired and reachable)"
+      printf '%s\n' "- $device_name: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (paired)"
+      ;;
+    command-error) printf '%s\n' 'command failed' >&2; exit 1 ;;
+    daemon-error) printf '%s\n' 'org.freedesktop.DBus.Error.ServiceUnknown' >&2; exit 1 ;;
+    timeout) sleep 2 ;;
+    *) printf '%s\n' "- $device_name: $device_id on 192.0.2.2 via lan (paired and reachable)" ;;
+  esac
+  exit 0
+fi
+
+if [[ "${1:-}" == "--device" ]]; then
+  [[ "${2:-}" == "$device_id" || "${2:-}" == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ]] || exit 1
+  case "${3:-}" in
+    --pair)
+      if [[ "$scenario" == "pair-rejected" ]]; then
+        printf '%s\n' 'Pair rejected' >&2
+      elif [[ "$scenario" != "pair-timeout" && -n "$state_file" ]]; then
+        : > "$state_file"
+      fi
+      ;;
+    --unpair)
+      [[ -z "$state_file" ]] || rm -f "$state_file"
+      ;;
+    --send-clipboard)
+      [[ "$scenario" != "send-error" ]] || { printf '%s\n' 'send failed' >&2; exit 1; }
+      ;;
+    *) exit 2 ;;
+  esac
+  exit 0
+fi
+
+exit 2

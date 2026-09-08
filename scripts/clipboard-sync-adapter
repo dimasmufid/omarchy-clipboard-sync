@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Stable JSON adapter between the Omarchy plugin and KDE Connect.
+
+The adapter deliberately keeps clipboard bytes out of argv, the environment,
+logs, temporary files, and JSON responses. KDE Connect reads the Wayland
+clipboard itself when --send-clipboard is invoked.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn, Sequence
+
+
+MAX_CLIPBOARD_BYTES = 64 * 1024
+DEFAULT_TIMEOUT_SECONDS = 5.0
+PAIR_TIMEOUT_SECONDS = 30.0
+DEVICE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,38}$")
+DEVICE_LINE_PATTERN = re.compile(
+    r"^- (?P<name>.*): (?P<id>[A-Za-z0-9_-]{32,38})(?: (?P<detail>.*?))?\s*$"
+)
+
+
+@dataclass(slots=True)
+class AdapterFailure(Exception):
+    code: str
+    message: str
+    exit_code: int
+    retryable: bool = False
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def response(operation: str, *, data: Any = None, error: AdapterFailure | None = None) -> dict[str, Any]:
+    if error is None:
+        return {
+            "ok": True,
+            "operation": operation,
+            "error": None,
+            "data": data,
+            "observedAt": now_iso(),
+        }
+    return {
+        "ok": False,
+        "operation": operation,
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "retryable": error.retryable,
+        },
+        "data": None,
+        "observedAt": now_iso(),
+    }
+
+
+def emit(payload: dict[str, Any]) -> None:
+    json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def fail(code: str, message: str, exit_code: int, *, retryable: bool = False) -> NoReturn:
+    raise AdapterFailure(code, message, exit_code, retryable)
+
+
+def executable(env_name: str, default_name: str, *, required: bool = True) -> str | None:
+    override = os.environ.get(env_name, "").strip()
+    if override:
+        candidate = Path(override)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        if required:
+            fail("DEPENDENCY_MISSING", f"Required executable is unavailable: {default_name}", 3)
+        return None
+
+    resolved = shutil.which(default_name)
+    if resolved:
+        return resolved
+    if required:
+        fail("DEPENDENCY_MISSING", f"Required executable is unavailable: {default_name}", 3)
+    return None
+
+
+def timeout_seconds() -> float:
+    raw = os.environ.get("CLIPBOARD_SYNC_TIMEOUT", "").strip()
+    if not raw:
+        return DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_TIMEOUT_SECONDS
+    return min(120.0, max(0.1, value))
+
+
+def pair_timeout_seconds() -> float:
+    raw = os.environ.get("CLIPBOARD_SYNC_PAIR_TIMEOUT", "").strip()
+    if not raw:
+        return PAIR_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return PAIR_TIMEOUT_SECONDS
+    return min(120.0, max(0.1, value))
+
+
+def clean_error(value: str, limit: int = 240) -> str:
+    text = " ".join(value.replace("\x00", "").split())
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def process_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    # Keep machine-oriented KDE Connect output untranslated without forcing an
+    # ASCII codeset that corrupts non-English device names.
+    env["LC_ALL"] = "C.UTF-8"
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        session_bus = Path(runtime_dir) / "bus"
+        if session_bus.exists():
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={session_bus}"
+    return env
+
+
+def run(
+    argv: Sequence[str],
+    *,
+    timeout: float | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    env = process_environment()
+    try:
+        completed = subprocess.run(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout if timeout is not None else timeout_seconds(),
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        fail("OPERATION_TIMEOUT", "KDE Connect did not respond in time.", 6, retryable=True)
+    except OSError as exc:
+        fail("DAEMON_UNAVAILABLE", f"Unable to start KDE Connect: {clean_error(str(exc))}", 3, retryable=True)
+
+    if check and completed.returncode != 0:
+        detail = clean_error(completed.stderr) or "KDE Connect returned an error."
+        lowered = detail.lower()
+        if "serviceunknown" in lowered or "dbus" in lowered or "daemon" in lowered:
+            fail("DAEMON_UNAVAILABLE", "The KDE Connect service is unavailable.", 3, retryable=True)
+        if "permission" in lowered or "denied" in lowered:
+            fail("PERMISSION_DENIED", "KDE Connect denied the operation.", 4)
+        fail("INTERNAL_ERROR", detail, 10, retryable=True)
+    return completed
+
+
+def kdeconnect_cli() -> str:
+    result = executable("CLIPBOARD_SYNC_KDECONNECT_CLI", "kdeconnect-cli")
+    assert result is not None
+    return result
+
+
+def wl_paste() -> str:
+    result = executable("CLIPBOARD_SYNC_WL_PASTE", "wl-paste")
+    assert result is not None
+    return result
+
+
+def validate_device_id(value: str | None) -> str:
+    candidate = (value or "").strip()
+    if not DEVICE_ID_PATTERN.fullmatch(candidate):
+        fail("INVALID_ARGUMENT", "The device ID is invalid.", 2)
+    return candidate
+
+
+def parse_device_line(line: str) -> dict[str, Any] | None:
+    match = DEVICE_LINE_PATTERN.fullmatch(line.rstrip())
+    if not match:
+        return None
+    detail = (match.group("detail") or "").strip().lower()
+    return {
+        "id": match.group("id"),
+        "name": clean_error(match.group("name"), 96) or "Unknown device",
+        "type": "unknown",
+        "paired": "paired" in detail,
+        "reachable": "reachable" in detail,
+        "clipboardCapable": None,
+    }
+
+
+def list_devices() -> list[dict[str, Any]]:
+    completed = run([kdeconnect_cli(), "--list-devices"])
+    devices: list[dict[str, Any]] = []
+    for raw_line in completed.stdout.splitlines():
+        parsed = parse_device_line(raw_line)
+        if parsed:
+            devices.append(parsed)
+
+    if completed.stdout.strip() and not devices:
+        fail("UNSUPPORTED_VERSION", "The KDE Connect device-list format is unsupported.", 3)
+
+    devices.sort(key=lambda item: (not item["reachable"], not item["paired"], item["name"].casefold(), item["id"]))
+    return devices
+
+
+def available_device_ids() -> set[str]:
+    completed = run([kdeconnect_cli(), "--list-available", "--id-only"])
+    return {
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if DEVICE_ID_PATTERN.fullmatch(line.strip())
+    }
+
+
+def find_device(device_id: str) -> dict[str, Any]:
+    for device in list_devices():
+        if device["id"] == device_id:
+            return device
+    fail("DEVICE_NOT_FOUND", "The selected device no longer exists.", 4, retryable=True)
+
+
+def doctor() -> dict[str, Any]:
+    cli = kdeconnect_cli()
+    paste = wl_paste()
+    version_result = run([cli, "--version"], check=False)
+    if version_result.returncode != 0:
+        fail("UNSUPPORTED_VERSION", "Unable to determine the KDE Connect version.", 3)
+    version = clean_error(version_result.stdout or version_result.stderr, 120)
+    if not version:
+        fail("UNSUPPORTED_VERSION", "KDE Connect returned no version information.", 3)
+    return {
+        "state": "ready",
+        "kdeconnectVersion": version,
+        "kdeconnectCli": cli,
+        "wlPaste": paste,
+    }
+
+
+def refresh() -> dict[str, Any]:
+    run([kdeconnect_cli(), "--refresh"])
+    return {"devices": list_devices()}
+
+
+def pair(device_id: str) -> dict[str, Any]:
+    device = find_device(device_id)
+    if device["paired"]:
+        return {"device": device, "state": "already-paired"}
+    if not device["reachable"]:
+        fail("DEVICE_OFFLINE", "The selected device is offline.", 4, retryable=True)
+
+    pair_timeout = pair_timeout_seconds()
+    completed = run([kdeconnect_cli(), "--device", device_id, "--pair"], timeout=pair_timeout)
+    detail = clean_error(completed.stderr or completed.stdout).lower()
+    if "reject" in detail:
+        fail("PAIR_REJECTED", "The pairing request was rejected.", 4)
+
+    deadline = time.monotonic() + pair_timeout
+    while time.monotonic() < deadline:
+        if device_id in available_device_ids():
+            paired = find_device(device_id)
+            return {"device": paired, "state": "paired"}
+        time.sleep(0.5)
+    fail("PAIR_TIMEOUT", "The pairing request timed out.", 6, retryable=True)
+
+
+def unpair(device_id: str) -> dict[str, Any]:
+    device = find_device(device_id)
+    if not device["paired"]:
+        return {"deviceId": device_id, "state": "already-unpaired"}
+    run([kdeconnect_cli(), "--device", device_id, "--unpair"])
+    return {"deviceId": device_id, "state": "unpaired"}
+
+
+def clipboard_bytes() -> bytes:
+    paste = wl_paste()
+    types_result = run([paste, "--list-types"], check=False)
+    if types_result.returncode != 0:
+        fail("CLIPBOARD_EMPTY", "There is no text to send.", 5)
+
+    types = {line.strip().lower() for line in types_result.stdout.splitlines()}
+    text_types = {
+        "text/plain",
+        "text/plain;charset=utf-8",
+        "text/plain;charset=utf8",
+        "text",
+        "utf8_string",
+        "string",
+    }
+    if not types.intersection(text_types):
+        if not types:
+            fail("CLIPBOARD_EMPTY", "There is no text to send.", 5)
+        fail("CLIPBOARD_NOT_TEXT", "Version 1 can send plain text only.", 5)
+
+    env = process_environment()
+    try:
+        process = subprocess.Popen(
+            [paste, "--type", "text", "--no-newline"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        assert process.stdout is not None
+        payload = b""
+        deadline = time.monotonic() + timeout_seconds()
+        while len(payload) <= MAX_CLIPBOARD_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                raise TimeoutError
+            chunk = os.read(process.stdout.fileno(), min(8192, MAX_CLIPBOARD_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload += chunk
+        if len(payload) > MAX_CLIPBOARD_BYTES:
+            process.kill()
+            process.wait()
+            fail("CLIPBOARD_TOO_LARGE", "Clipboard text is larger than 64 KiB.", 5)
+        remaining = max(0.1, deadline - time.monotonic())
+        process.wait(timeout=remaining)
+    except (subprocess.TimeoutExpired, TimeoutError):
+        process.kill()
+        process.wait()
+        fail("OPERATION_TIMEOUT", "Reading the clipboard timed out.", 6, retryable=True)
+    except OSError as exc:
+        fail("INTERNAL_ERROR", f"Unable to read the clipboard: {clean_error(str(exc))}", 10, retryable=True)
+
+    if process.returncode != 0:
+        fail("CLIPBOARD_EMPTY", "There is no text to send.", 5)
+    if not payload:
+        fail("CLIPBOARD_EMPTY", "There is no text to send.", 5)
+    try:
+        payload.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("CLIPBOARD_NOT_TEXT", "The clipboard is not valid UTF-8 text.", 5)
+    return payload
+
+
+def send_clipboard(device_id: str) -> dict[str, Any]:
+    if device_id not in available_device_ids():
+        device = find_device(device_id)
+        if not device["paired"]:
+            fail("DEVICE_UNPAIRED", "Pair the selected device before sending clipboard text.", 4)
+        fail("DEVICE_OFFLINE", "The selected device is offline.", 4, retryable=True)
+
+    payload = clipboard_bytes()
+    run([kdeconnect_cli(), "--device", device_id, "--send-clipboard"])
+    return {"deviceId": device_id, "state": "sent-to-kde-connect", "sizeBytes": len(payload)}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Omarchy Clipboard Sync adapter")
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+    subparsers.add_parser("doctor")
+    subparsers.add_parser("devices")
+    subparsers.add_parser("refresh")
+    for name in ("pair", "unpair", "send"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--device-id", required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    operation = "unknown"
+    try:
+        args = build_parser().parse_args(argv)
+        operation = args.operation
+        if operation == "doctor":
+            data = doctor()
+        elif operation == "devices":
+            data = {"devices": list_devices()}
+        elif operation == "refresh":
+            data = refresh()
+        elif operation == "pair":
+            data = pair(validate_device_id(args.device_id))
+        elif operation == "unpair":
+            data = unpair(validate_device_id(args.device_id))
+        elif operation == "send":
+            data = send_clipboard(validate_device_id(args.device_id))
+        else:
+            fail("INVALID_ARGUMENT", "Unknown operation.", 2)
+        emit(response(operation, data=data))
+        return 0
+    except AdapterFailure as exc:
+        emit(response(operation, error=exc))
+        return exc.exit_code
+    except KeyboardInterrupt:
+        error = AdapterFailure("OPERATION_TIMEOUT", "The operation was interrupted.", 6, True)
+        emit(response(operation, error=error))
+        return error.exit_code
+    except Exception:
+        error = AdapterFailure("INTERNAL_ERROR", "The adapter encountered an unexpected error.", 10, True)
+        emit(response(operation, error=error))
+        return error.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
